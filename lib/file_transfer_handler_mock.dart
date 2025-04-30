@@ -14,7 +14,7 @@ class MockFileTransferHandler implements FileTransferHandler {
   }) async {
     final taskId = DateTime.now().toIso8601String();
     _progressControllers[taskId] = StreamController<double>();
-    
+
     // Simulate download progress
     Timer.periodic(const Duration(milliseconds: 100), (timer) {
       final controller = _progressControllers[taskId];
@@ -22,7 +22,7 @@ class MockFileTransferHandler implements FileTransferHandler {
         timer.cancel();
         return;
       }
-      
+
       double progress = 0.0;
       controller.addStream(Stream.periodic(
         const Duration(milliseconds: 100),
@@ -105,7 +105,7 @@ class MockFileTransferHandler implements FileTransferHandler {
     if (controller == null) {
       return false;
     }
-    
+
     await controller.close();
     _progressControllers.remove(taskId);
     _completedTasks.remove(taskId);

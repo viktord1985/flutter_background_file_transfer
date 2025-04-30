@@ -13,7 +13,7 @@ void main() {
   late Directory tempDir;
   final mockDownloadUrl = 'http://example.com/test.txt';
   final mockUploadUrl = 'http://example.com/upload';
-  
+
   setUpAll(() async {
     tempDir = await getTemporaryDirectory();
   });
@@ -67,31 +67,35 @@ void main() {
 
       timeoutTimer = Timer(const Duration(seconds: 60), () {
         if (!progressCompleter.isCompleted) {
-          progressCompleter.completeError(TimeoutException('Download timed out'));
+          progressCompleter.completeError(
+            TimeoutException('Download timed out'),
+          );
         }
         progressSubscription?.cancel();
       });
 
-      progressSubscription = transfer.getDownloadProgress(taskId).listen(
-        (progress) {
-          expect(progress, greaterThanOrEqualTo(lastProgress));
-          expect(progress, inInclusiveRange(0.0, 1.0));
-          lastProgress = progress;
-          if (progress >= 1.0 && !progressCompleter.isCompleted) {
-            progressCompleter.complete();
-          }
-        },
-        onDone: () {
-          if (!progressCompleter.isCompleted) {
-            progressCompleter.complete();
-          }
-        },
-        onError: (error) {
-          if (!progressCompleter.isCompleted) {
-            progressCompleter.completeError(error);
-          }
-        },
-      );
+      progressSubscription = transfer
+          .getDownloadProgress(taskId)
+          .listen(
+            (progress) {
+              expect(progress, greaterThanOrEqualTo(lastProgress));
+              expect(progress, inInclusiveRange(0.0, 1.0));
+              lastProgress = progress;
+              if (progress >= 1.0 && !progressCompleter.isCompleted) {
+                progressCompleter.complete();
+              }
+            },
+            onDone: () {
+              if (!progressCompleter.isCompleted) {
+                progressCompleter.complete();
+              }
+            },
+            onError: (error) {
+              if (!progressCompleter.isCompleted) {
+                progressCompleter.completeError(error);
+              }
+            },
+          );
 
       // Wait for download to complete
       try {
@@ -103,7 +107,6 @@ void main() {
         timeoutTimer.cancel();
         await progressSubscription.cancel();
       }
-
     } catch (e) {
       debugPrint('Test failed with error: $e');
       if (taskId != null) {
@@ -116,15 +119,15 @@ void main() {
   testWidgets('Download with invalid URL fails', (WidgetTester tester) async {
     final savePath = '${tempDir.path}/test_download_fail.txt';
     String? taskId;
-    
+
     try {
       taskId = await transfer.startDownload(
         fileUrl: 'http://invalid.example.com/test.txt',
         savePath: savePath,
       );
-      
+
       expect(taskId, isNotEmpty);
-      
+
       // Expect the download progress to throw an error
       expect(
         transfer.getDownloadProgress(taskId),
@@ -169,26 +172,28 @@ void main() {
         progressSubscription?.cancel();
       });
 
-      progressSubscription = transfer.getUploadProgress(taskId).listen(
-        (progress) {
-          expect(progress, greaterThanOrEqualTo(lastProgress));
-          expect(progress, inInclusiveRange(0.0, 1.0));
-          lastProgress = progress;
-          if (progress >= 1.0 && !progressCompleter.isCompleted) {
-            progressCompleter.complete();
-          }
-        },
-        onDone: () {
-          if (!progressCompleter.isCompleted) {
-            progressCompleter.complete();
-          }
-        },
-        onError: (error) {
-          if (!progressCompleter.isCompleted) {
-            progressCompleter.completeError(error);
-          }
-        },
-      );
+      progressSubscription = transfer
+          .getUploadProgress(taskId)
+          .listen(
+            (progress) {
+              expect(progress, greaterThanOrEqualTo(lastProgress));
+              expect(progress, inInclusiveRange(0.0, 1.0));
+              lastProgress = progress;
+              if (progress >= 1.0 && !progressCompleter.isCompleted) {
+                progressCompleter.complete();
+              }
+            },
+            onDone: () {
+              if (!progressCompleter.isCompleted) {
+                progressCompleter.complete();
+              }
+            },
+            onError: (error) {
+              if (!progressCompleter.isCompleted) {
+                progressCompleter.completeError(error);
+              }
+            },
+          );
 
       try {
         await progressCompleter.future;
@@ -197,7 +202,6 @@ void main() {
         timeoutTimer.cancel();
         await progressSubscription.cancel();
       }
-
     } catch (e) {
       debugPrint('Test failed with error: $e');
       if (taskId != null) {
@@ -218,7 +222,7 @@ void main() {
       // Test upload cancellation
       final uploadFile = File(uploadFilePath);
       await uploadFile.writeAsString('Test content for cancelled upload');
-      
+
       uploadTaskId = await transfer.startUpload(
         filePath: uploadFilePath,
         uploadUrl: mockUploadUrl,

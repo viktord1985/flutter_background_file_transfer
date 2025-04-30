@@ -14,10 +14,7 @@ void main() {
     await tester.pumpWidget(const MyApp());
 
     // Verify that the app title is displayed
-    expect(
-      find.text('File Transfer Plugin Demo'),
-      findsOneWidget,
-    );
+    expect(find.text('File Transfer Plugin Demo'), findsOneWidget);
 
     // Verify that both Upload and Download sections exist
     expect(find.text('Upload'), findsOneWidget);

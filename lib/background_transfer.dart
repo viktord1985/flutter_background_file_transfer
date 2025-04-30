@@ -16,5 +16,6 @@ FileTransferHandler getBackgroundTransfer() {
   } else if (Platform.isIOS) {
     return IosFileTransferHandler();
   }
-  throw UnsupportedError('Background transfer is not supported on this platform.');
+  throw UnsupportedError(
+      'Background transfer is not supported on this platform.');
 }

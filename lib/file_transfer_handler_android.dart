@@ -29,8 +29,9 @@ class AndroidFileTransferHandler implements FileTransferHandler {
       await _channel.invokeMethod('getDownloadProgress', {
         'task_id': taskId,
       });
-      
-      final eventChannel = EventChannel('background_transfer/download_progress_$taskId');
+
+      final eventChannel =
+          EventChannel('background_transfer/download_progress_$taskId');
       yield* eventChannel.receiveBroadcastStream().map((progress) {
         return (progress as num).toDouble();
       });
@@ -77,8 +78,9 @@ class AndroidFileTransferHandler implements FileTransferHandler {
       await _channel.invokeMethod('getUploadProgress', {
         'task_id': taskId,
       });
-      
-      final eventChannel = EventChannel('background_transfer/upload_progress_$taskId');
+
+      final eventChannel =
+          EventChannel('background_transfer/upload_progress_$taskId');
       yield* eventChannel.receiveBroadcastStream().map((progress) {
         if (progress is String && progress.startsWith('error:')) {
           throw Exception(progress.substring(6));

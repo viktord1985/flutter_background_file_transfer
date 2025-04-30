@@ -29,8 +29,9 @@ class IosFileTransferHandler implements FileTransferHandler {
       await _channel.invokeMethod('getDownloadProgress', {
         'task_id': taskId,
       });
-      
-      final eventChannel = EventChannel('background_transfer/download_progress_$taskId');
+
+      final eventChannel =
+          EventChannel('background_transfer/download_progress_$taskId');
       yield* eventChannel.receiveBroadcastStream().map((progress) {
         return (progress as num).toDouble();
       });
@@ -43,8 +44,9 @@ class IosFileTransferHandler implements FileTransferHandler {
   Future<bool> isDownloadComplete(String taskId) async {
     try {
       return await _channel.invokeMethod('isDownloadComplete', {
-        'task_id': taskId,
-      }) ?? false;
+            'task_id': taskId,
+          }) ??
+          false;
     } on PlatformException {
       return false;
     }
@@ -76,8 +78,9 @@ class IosFileTransferHandler implements FileTransferHandler {
       await _channel.invokeMethod('getUploadProgress', {
         'task_id': taskId,
       });
-      
-      final eventChannel = EventChannel('background_transfer/upload_progress_$taskId');
+
+      final eventChannel =
+          EventChannel('background_transfer/upload_progress_$taskId');
       yield* eventChannel.receiveBroadcastStream().map((progress) {
         return (progress as num).toDouble();
       });
@@ -90,8 +93,9 @@ class IosFileTransferHandler implements FileTransferHandler {
   Future<bool> isUploadComplete(String taskId) async {
     try {
       return await _channel.invokeMethod('isUploadComplete', {
-        'task_id': taskId,
-      }) ?? false;
+            'task_id': taskId,
+          }) ??
+          false;
     } on PlatformException {
       return false;
     }
@@ -101,8 +105,9 @@ class IosFileTransferHandler implements FileTransferHandler {
   Future<bool> cancelTask(String taskId) async {
     try {
       return await _channel.invokeMethod('cancelTask', {
-        'task_id': taskId,
-      }) ?? false;
+            'task_id': taskId,
+          }) ??
+          false;
     } on PlatformException {
       return false;
     }

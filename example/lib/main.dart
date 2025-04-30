@@ -332,8 +332,7 @@ class _FileTransferDemoState extends State<FileTransferDemo>
       taskId = await taskHandler.startUpload(
         filePath: file.absolute.path,
         uploadUrl: uploadUrl,
-        headers: {
-          'Accept': '*/*',    },
+        headers: {'Accept': '*/*'},
       );
 
       activeTasks.add(taskId);
