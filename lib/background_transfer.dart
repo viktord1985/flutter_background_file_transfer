@@ -1,5 +1,5 @@
 /// A Flutter plugin for handling background file transfers with progress tracking.
-/// 
+///
 /// This plugin provides a high-level interface for uploading and downloading files
 /// in the background on both iOS and Android platforms. It handles platform-specific
 /// implementations to ensure reliable background transfers that continue even when
