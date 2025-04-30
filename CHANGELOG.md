@@ -1,3 +1,12 @@
+## 1.1.0
+
+* Added comprehensive API documentation for all public interfaces
+* Improved error handling and error messages
+* Added detailed code examples in README
+* Enhanced type safety across the API
+* Performance improvements in background transfer handling
+* Updated dependencies to latest stable versions
+
 ## 1.0.0
 
 First stable release with the following features:
