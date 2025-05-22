@@ -1,3 +1,10 @@
+## 1.1.1
+
+* Added documentation example for queue management using BLoC pattern
+* Added documentation for future native queue management implementations
+* Updated documentation structure for better clarity
+* Added documentation example for BlocProvider usage
+
 ## 1.1.0
 
 * Added comprehensive API documentation for all public interfaces

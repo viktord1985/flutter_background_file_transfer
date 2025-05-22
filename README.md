@@ -21,7 +21,7 @@ Add this to your package's pubspec.yaml file:
 
 ```yaml
 dependencies:
-  background_transfer: ^0.0.1
+  background_transfer: ^1.0.0
 ```
 
 ## Usage
@@ -176,6 +176,117 @@ if #available(iOS 15.0, *) {
 }
 ```
 
+## Advanced Usage: Implementing Queue Management
+
+The plugin provides basic transfer capabilities but does not include queue management. Here's a suggested implementation using BLoC pattern to add queuing in your application:
+
+```dart
+// transfer_task.dart
+class TransferTask {
+  final String id;
+  final String path;     // filePath for upload, savePath for download
+  final String url;      // uploadUrl for upload, fileUrl for download
+  final Map<String, String> headers;
+  final Map<String, String> fields;  // Only for upload
+  final String? taskId;
+  final bool isUpload;  // true for upload, false for download
+
+  TransferTask({
+    required this.id,
+    required this.path,
+    required this.url,
+    required this.headers,
+    required this.isUpload,
+    this.fields = const {},
+    this.taskId,
+  });
+
+  // Add fromJson/toJson methods...
+}
+
+// transfer_bloc.dart
+class TransferBloc extends HydratedBloc<TransferEvent, TransferState> {
+  final FileTransferHandler transfer;
+  StreamSubscription<double>? _progressSub;
+
+  TransferBloc(this.transfer) : super(const TransferState()) {
+    on<AddTransferTask>(_onAddTransferTask);
+    on<StartNextTransfer>(_onStartNextTransfer);
+    on<TransferCompleted>(_onTransferCompleted);
+    // Add other event handlers...
+  }
+
+  // Implementation details...
+}
+```
+
+### Using the Transfer Queue
+
+First, wrap your app with BlocProvider to make the TransferBloc available throughout your widget tree:
+
+```dart
+void main() {
+  runApp(
+    MultiBlocProvider(
+      providers: [
+        BlocProvider<TransferBloc>(
+          create: (context) => TransferBloc(getBackgroundTransfer()),
+        ),
+      ],
+      child: MyApp(),
+    ),
+  );
+}
+```
+
+Then you can access the bloc from any widget:
+
+```dart
+// Get the bloc instance
+final transferBloc = context.read<TransferBloc>();
+
+// Add a download task
+transferBloc.add(AddTransferTask(
+  TransferTask(
+    id: 'unique_id',
+    path: '/path/to/save/file.pdf',
+    url: 'https://example.com/file.pdf',
+    headers: {'Authorization': 'Bearer token'},
+    isUpload: false,
+  ),
+));
+
+// Add an upload task
+transferBloc.add(AddTransferTask(
+  TransferTask(
+    id: 'unique_id',
+    path: '/path/to/file.pdf',
+    url: 'https://example.com/upload',
+    headers: {'Authorization': 'Bearer token'},
+    fields: {'title': 'My Document'},
+    isUpload: true,
+  ),
+));
+
+// Listen to state changes
+StreamBuilder<TransferState>(
+  stream: transferBloc.stream,
+  builder: (context, snapshot) {
+    // Build your UI based on the state
+    return // Your widget tree...
+  },
+);
+```
+
+This queue implementation example provides:
+- One transfer at a time to prevent bandwidth competition
+- Persistent task queue across app restarts (using HydratedBloc)
+- Proper error handling and retry mechanisms
+- Clean cancellation and resume functionality
+- Progress tracking for the active transfer
+
+Note: This is just one way to implement queuing. You can adapt this example or create your own implementation based on your specific needs.
+
 ## Notes
 
 - Files are downloaded and uploaded in the background, allowing transfers to continue even when the app is in the background
@@ -183,4 +294,19 @@ if #available(iOS 15.0, *) {
 - The plugin automatically handles lifecycle changes and restores progress tracking when the app is resumed
 - Concurrent transfers are supported and tracked independently
 - MIME types are automatically detected based on file extensions
+
+## Upcoming Features
+
+Future versions will include:
+- Native queue management implementation templates
+  - iOS: Example implementation using NSURLSession with built-in queue management
+  - Android: Example implementation using WorkManager with transfer queue
+  - This will allow developers to implement queue management directly in their apps without depending on the plugin's queue system
+- Advanced retry strategies with exponential backoff
+- Bandwidth throttling options
+- Transfer prioritization
+- Network type restrictions (WiFi only, etc.)
+- More granular progress reporting
+
+Note: While the plugin uses NSURLSession (iOS) and WorkManager (Android) for background transfers, it does not include queue management. The upcoming feature will provide native example implementations to help developers implement queue management in their preferred way, either at the Dart level (as shown in the Advanced Usage section) or directly in native code.
 
