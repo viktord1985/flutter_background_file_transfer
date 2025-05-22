@@ -181,15 +181,235 @@ if #available(iOS 15.0, *) {
 The plugin provides basic transfer capabilities but does not include queue management. Here's a suggested implementation using BLoC pattern to add queuing in your application:
 
 ```dart
-// transfer_task.dart
+// transfer_bloc.dart
+class TransferBloc extends HydratedBloc<TransferEvent, TransferState> {
+  final FileTransferHandler transfer;
+  StreamSubscription<double>? _progressSub;
+
+  TransferBloc(this.transfer) : super(const TransferState()) {
+    on<AddTransferTask>(_onAddTransferTask);
+    on<StartNextTransfer>(_onStartNextTransfer);
+    on<TransferProgressUpdated>(_onTransferProgressUpdated);
+    on<TransferCompleted>(_onTransferCompleted);
+    on<CancelTransfer>(_onCancelTransfer);
+    on<ResumeTransfer>(_onResumeTransfer);
+  }
+
+  void _onResumeTransfer(ResumeTransfer event, Emitter<TransferState> emit) {
+    final task = state.activeTask;
+    if (task != null && task.taskId == null) {
+      final newQueue = state.queue;
+      emit(TransferState(
+        queue: newQueue,
+        activeTask: null,
+      ));
+      add(StartNextTransfer());
+      return;
+    }
+    if (task == null) return;
+
+    _progressSub = (task.isUpload 
+      ? transfer.getUploadProgress(task.taskId!)
+      : transfer.getDownloadProgress(task.taskId!)).listen(
+        (progress){},
+        onDone: () => add(TransferCompleted()),
+        onError: (_) => add(TransferCompleted()),
+        cancelOnError: true,
+      );
+  }
+
+  void _onAddTransferTask(AddTransferTask event, Emitter<TransferState> emit) {
+    List<TransferTask> updatedQueue = List<TransferTask>.from(state.queue)
+      ..add(event.task);
+    final shouldStartTransfer = state.activeTask == null;
+    final newState = TransferState(
+      queue: updatedQueue,
+      activeTask: state.activeTask,
+    );
+    emit(newState);
+
+    if (shouldStartTransfer) {
+      add(StartNextTransfer());
+    }
+  }
+
+  void _onStartNextTransfer(StartNextTransfer event, Emitter<TransferState> emit) async {
+    if (state.activeTask != null || state.queue.isEmpty) return;
+
+    final nextTask = state.queue.first;
+    final newQueue = state.queue.sublist(1);
+
+    emit(TransferState(
+      queue: newQueue,
+      activeTask: nextTask,
+    ));
+
+    try {
+      String? taskId = nextTask.isUpload
+          ? await transfer.startUpload(
+              filePath: nextTask.path,
+              uploadUrl: nextTask.url,
+              headers: nextTask.headers,
+              fields: nextTask.fields,
+            )
+          : await transfer.startDownload(
+              fileUrl: nextTask.url,
+              savePath: nextTask.path,
+              headers: nextTask.headers,
+            );
+
+      final updatedTask = nextTask.copyWith(taskId: taskId);
+
+      emit(TransferState(
+        queue: newQueue,
+        activeTask: updatedTask,
+      ));
+
+      _progressSub = (nextTask.isUpload 
+        ? transfer.getUploadProgress(taskId!)
+        : transfer.getDownloadProgress(taskId!)).listen(
+          (progress){},
+          onDone: () => add(TransferCompleted()),
+          onError: (_) => add(TransferCompleted()),
+          cancelOnError: true,
+        );
+    } catch (_) {
+      emit(TransferState(
+        queue: newQueue,
+        activeTask: null,
+      ));
+      add(StartNextTransfer());
+    }
+  }
+
+  void _onTransferProgressUpdated(
+      TransferProgressUpdated event, Emitter<TransferState> emit) {
+    if (state.activeTask == null) return;
+    emit(state.copyWith(
+      activeTask: state.activeTask!.copyWith(progress: event.progress),
+    ));
+  }
+
+  void _onTransferCompleted(TransferCompleted event, Emitter<TransferState> emit) {
+    _progressSub?.cancel();
+    emit(state.copyWith(activeTask: null));
+    add(StartNextTransfer());
+  }
+
+  void _onCancelTransfer(CancelTransfer event, Emitter<TransferState> emit) {
+    if (state.activeTask?.taskId == event.taskId) {
+      transfer.cancelTask(event.taskId);
+      _progressSub?.cancel();
+      emit(state.copyWith(activeTask: null));
+      add(StartNextTransfer());
+    }
+  }
+
+  @override
+  Future<void> close() {
+    _progressSub?.cancel();
+    return super.close();
+  }
+
+  @override
+  TransferState? fromJson(Map<String, dynamic> json) {
+    try {
+      final state = TransferState.fromJson(json);
+      if (state.activeTask != null) {
+        add(ResumeTransfer());
+      }
+      return state;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  @override
+  Map<String, dynamic>? toJson(TransferState state) {
+    try {
+      return state.toJson();
+    } catch (e) {
+      return null;
+    }
+  }
+}
+
+
+
+
+
+// transfer_event.dart
+abstract class TransferEvent {}
+
+class AddTransferTask extends TransferEvent {
+  final TransferTask task;
+  AddTransferTask(this.task);
+}
+
+class StartNextTransfer extends TransferEvent {}
+
+class TransferProgressUpdated extends TransferEvent {
+  final double progress;
+  TransferProgressUpdated(this.progress);
+}
+
+class TransferCompleted extends TransferEvent {}
+
+class ResumeTransfer extends TransferEvent {}
+
+class CancelTransfer extends TransferEvent {
+  final String taskId;
+  CancelTransfer(this.taskId);
+}
+
+// transfer_state.dart
+class TransferState {
+  final List<TransferTask> queue;
+  final TransferTask? activeTask;
+
+  const TransferState({
+    this.queue = const [],
+    this.activeTask,
+  });
+
+  TransferState copyWith({
+    List<TransferTask>? queue,
+    TransferTask? activeTask,
+  }) {
+    return TransferState(
+      queue: queue ?? this.queue,
+      activeTask: activeTask ?? this.activeTask,
+    );
+  }
+
+  factory TransferState.fromJson(Map<String, dynamic> json) {
+    return TransferState(
+      queue: (json['queue'] as List<dynamic>)
+          .map((e) => TransferTask.fromJson(e))
+          .toList(),
+      activeTask: json['activeTask'] != null
+          ? TransferTask.fromJson(json['activeTask'])
+          : null,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'queue': queue.map((e) => e.toJson()).toList(),
+      'activeTask': activeTask?.toJson(),
+    };
+  }
+}
+
+// Enhanced TransferTask with progress
 class TransferTask {
   final String id;
   final String path;     // filePath for upload, savePath for download
   final String url;      // uploadUrl for upload, fileUrl for download
   final Map<String, String> headers;
-  final Map<String, String> fields;  // Only for upload
+  final Map<String, String> fields;
   final String? taskId;
-  final bool isUpload;  // true for upload, false for download
+  final bool isUpload;
 
   TransferTask({
     required this.id,
@@ -201,22 +421,49 @@ class TransferTask {
     this.taskId,
   });
 
-  // Add fromJson/toJson methods...
-}
-
-// transfer_bloc.dart
-class TransferBloc extends HydratedBloc<TransferEvent, TransferState> {
-  final FileTransferHandler transfer;
-  StreamSubscription<double>? _progressSub;
-
-  TransferBloc(this.transfer) : super(const TransferState()) {
-    on<AddTransferTask>(_onAddTransferTask);
-    on<StartNextTransfer>(_onStartNextTransfer);
-    on<TransferCompleted>(_onTransferCompleted);
-    // Add other event handlers...
+  TransferTask copyWith({
+    String? id,
+    String? path,
+    String? url,
+    Map<String, String>? headers,
+    Map<String, String>? fields,
+    String? taskId,
+    bool? isUpload,
+  }) {
+    return TransferTask(
+      id: id ?? this.id,
+      path: path ?? this.path,
+      url: url ?? this.url,
+      headers: headers ?? this.headers,
+      fields: fields ?? this.fields,
+      taskId: taskId ?? this.taskId,
+      isUpload: isUpload ?? this.isUpload,
+    );
   }
 
-  // Implementation details...
+  factory TransferTask.fromJson(Map<String, dynamic> json) {
+    return TransferTask(
+      id: json['id'],
+      path: json['path'],
+      url: json['url'],
+      headers: Map<String, String>.from(json['headers']),
+      fields: Map<String, String>.from(json['fields'] ?? {}),
+      taskId: json['taskId'],
+      isUpload: json['isUpload'],
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'path': path,
+      'url': url,
+      'headers': headers,
+      'fields': fields,
+      'taskId': taskId,
+      'isUpload': isUpload,
+    };
+  }
 }
 ```
 
@@ -303,6 +550,11 @@ Future versions will include:
   - Android: Example implementation using WorkManager with transfer queue
   - This will allow developers to implement queue management directly in their apps without depending on the plugin's queue system
 - Advanced retry strategies with exponential backoff
+  - Configurable retry attempts with customizable delays
+  - Intelligent retry based on error type (network, server, etc.)
+  - Exponential backoff with jitter for distributed systems
+  - Per-task retry configuration
+  - Resume capability for interrupted transfers
 - Bandwidth throttling options
 - Transfer prioritization
 - Network type restrictions (WiFi only, etc.)
