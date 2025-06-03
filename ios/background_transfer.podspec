@@ -4,8 +4,8 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'background_transfer'
-  s.version          = '0.0.1'
-  s.summary          = 'A new Flutter plugin project.'
+  s.version          = '1.2.0'
+  s.summary          = 'A Flutter plugin for background file transfers with queue management.'
   s.description      = <<-DESC
 A new Flutter plugin project.
                        DESC

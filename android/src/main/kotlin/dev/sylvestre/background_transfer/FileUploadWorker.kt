@@ -18,6 +18,8 @@ import okio.BufferedSink
 import okio.ForwardingSink
 import okio.buffer
 import java.io.File
+import java.io.IOException
+import java.net.URLConnection
 import androidx.work.*
 import java.util.concurrent.TimeUnit
 
@@ -25,6 +27,7 @@ class FileUploadWorker(
     private val context: Context,
     params: WorkerParameters
 ) : CoroutineWorker(context, params) {
+
     private val notificationHelper = NotificationHelper(context)
 
     companion object {
@@ -32,26 +35,22 @@ class FileUploadWorker(
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
-        val filePath = inputData.getString("file_path")
-            ?: return@withContext Result.failure()
-        val uploadUrl = inputData.getString("upload_url")
-            ?: return@withContext Result.failure()
-        val headersKeys = inputData.getStringArray("headers_keys") ?: emptyArray()
-        val headersValues = inputData.getStringArray("headers_values") ?: emptyArray()
-        val fieldsKeys = inputData.getStringArray("fields_keys") ?: emptyArray()
-        val fieldsValues = inputData.getStringArray("fields_values") ?: emptyArray()
-        
-        val headers = headersKeys.zip(headersValues).toMap()
-        val fields = fieldsKeys.zip(fieldsValues).toMap()
+        val filePath = inputData.getString("file_path") ?: return@withContext Result.failure()
+        val uploadUrl = inputData.getString("upload_url") ?: return@withContext Result.failure()
 
-        // Show start notification
+        val headers = inputData.getStringArray("headers_keys")
+            ?.zip(inputData.getStringArray("headers_values") ?: emptyArray())?.toMap() ?: emptyMap()
+
+        val fields = inputData.getStringArray("fields_keys")
+            ?.zip(inputData.getStringArray("fields_values") ?: emptyArray())?.toMap() ?: emptyMap()
+
         notificationHelper.showStartNotification("upload", id.toString())
 
         val file = File(filePath)
         if (!file.exists()) {
-            Log.e(TAG, "File does not exist: $filePath")
-            notificationHelper.showCompleteNotification("upload", id.toString(), 
-                Exception("File does not exist: $filePath"))
+            val error = "File does not exist: $filePath"
+            Log.e(TAG, error)
+            notificationHelper.showCompleteNotification("upload", id.toString(), Exception(error))
             return@withContext Result.failure()
         }
 
@@ -61,24 +60,31 @@ class FileUploadWorker(
             .readTimeout(30, TimeUnit.SECONDS)
             .build()
 
-        val multipartBuilder = MultipartBody.Builder()
-            .setType(MultipartBody.FORM)
+        val multipartBuilder = MultipartBody.Builder().setType(MultipartBody.FORM)
+        fields.forEach { (key, value) -> multipartBuilder.addFormDataPart(key, value) }
 
-        fields.forEach { (key, value) ->
-            multipartBuilder.addFormDataPart(key, value)
-        }
-
+        var lastProgress = -1
         val mimeType = getMimeType(file.absolutePath)
         val fileRequestBody = file.asRequestBody(mimeType.toMediaTypeOrNull())
+
         val countingRequestBody = CountingRequestBody(fileRequestBody) { bytesWritten, contentLength ->
-            val progress = (bytesWritten * 100 / contentLength).toInt()
-            notificationHelper.updateProgressNotification("upload", id.toString(), progress)
-            setProgressAsync(Data.Builder()
-                .putInt("progress", progress)
-                .build())
-            
-            if (progress >= 100) {
-                notificationHelper.showCompleteNotification("upload", id.toString())
+            if (isStopped) return@CountingRequestBody  // Exit early on cancel
+
+            val progress = if (contentLength > 0) {
+                (bytesWritten * 100 / contentLength).toInt()
+            } else 0
+
+            if (progress != lastProgress && progress in 0..100) {
+                notificationHelper.updateProgressNotification("upload", id.toString(), progress)
+
+                context.getSharedPreferences("transfer_progress", Context.MODE_PRIVATE)
+                    .edit()
+                    .putFloat("progress_${id}", progress / 100.0f)
+                    .apply()
+
+                setProgressAsync(workDataOf("progress" to progress))
+
+                lastProgress = progress
             }
         }
 
@@ -86,51 +92,48 @@ class FileUploadWorker(
 
         val request = Request.Builder()
             .url(uploadUrl)
-            .apply {
-                headers.forEach { (key, value) ->
-                    addHeader(key, value)
-                }
-            }
+            .apply { headers.forEach { (k, v) -> addHeader(k, v) } }
             .post(multipartBuilder.build())
             .build()
 
-        return@withContext try {
+        try {
             Log.i(TAG, "Executing upload request")
             val response = client.newCall(request).execute()
+
             if (!response.isSuccessful) {
-                val errorMessage = "Upload failed with code: ${response.code}"
+                val errorMessage = "Upload failed: ${response.code}"
                 Log.e(TAG, errorMessage)
-                notificationHelper.showCompleteNotification("upload", id.toString(), 
-                    Exception(errorMessage))
-                Result.failure(workDataOf("error" to errorMessage))
-            } else {
-                Log.i(TAG, "Upload completed successfully")
-                notificationHelper.showCompleteNotification("upload", id.toString())
-                Result.success()
+                notificationHelper.showCompleteNotification("upload", id.toString(), Exception(errorMessage))
+                return@withContext Result.retry() // Retry on failure
             }
+
+            Log.i(TAG, "Upload success")
+            notificationHelper.showCompleteNotification("upload", id.toString())
+            return@withContext Result.success()
+
         } catch (e: Exception) {
-            Log.e(TAG, "Upload failed with exception", e)
+            Log.e(TAG, "Upload exception", e)
             notificationHelper.showCompleteNotification("upload", id.toString(), e)
-            Result.failure(workDataOf("error" to e.message))
+            return@withContext Result.retry() // Retry network exceptions
         }
     }
 
     private fun getMimeType(path: String): String {
-        val extension = path.substringAfterLast('.', "")
-        return when (extension.lowercase()) {
-            "png" -> "image/png"
-            "jpg", "jpeg" -> "image/jpeg"
-            "gif" -> "image/gif"
-            "mp4" -> "video/mp4"
-            "mov" -> "video/quicktime"
-            "pdf" -> "application/pdf"
-            "doc" -> "application/msword"
-            "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            "xls" -> "application/vnd.ms-excel"
-            "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            "zip" -> "application/zip"
-            else -> "application/octet-stream"
-        }
+        return URLConnection.guessContentTypeFromName(path)
+            ?: when (path.substringAfterLast('.', "").lowercase()) {
+                "png" -> "image/png"
+                "jpg", "jpeg" -> "image/jpeg"
+                "gif" -> "image/gif"
+                "mp4" -> "video/mp4"
+                "mov" -> "video/quicktime"
+                "pdf" -> "application/pdf"
+                "doc" -> "application/msword"
+                "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                "xls" -> "application/vnd.ms-excel"
+                "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                "zip" -> "application/zip"
+                else -> "application/octet-stream"
+            }
     }
 }
 
@@ -138,19 +141,27 @@ private class CountingRequestBody(
     private val delegate: RequestBody,
     private val onProgress: (bytesWritten: Long, contentLength: Long) -> Unit
 ) : RequestBody() {
+
     override fun contentType() = delegate.contentType()
-    override fun contentLength() = delegate.contentLength()
+
+    override fun contentLength(): Long {
+        return try {
+            delegate.contentLength()
+        } catch (e: IOException) {
+            -1L
+        }
+    }
 
     override fun writeTo(sink: BufferedSink) {
         val countingSink = object : ForwardingSink(sink) {
-            private var bytesWritten = 0L
-
+            var bytesWritten = 0L
             override fun write(source: Buffer, byteCount: Long) {
                 super.write(source, byteCount)
                 bytesWritten += byteCount
                 onProgress(bytesWritten, contentLength())
             }
         }.buffer()
+
         delegate.writeTo(countingSink)
         countingSink.flush()
     }

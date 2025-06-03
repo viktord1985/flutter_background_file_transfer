@@ -1,6 +1,7 @@
 package dev.sylvestre.background_transfer
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin
+import java.util.Date
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.MethodCall
@@ -28,6 +29,9 @@ class BackgroundTransferPlugin: FlutterPlugin, MethodCallHandler, ActivityAware 
   private lateinit var context: Context
   private lateinit var activity: Activity
   private lateinit var binaryMessenger: BinaryMessenger
+  private val queueManager by lazy {
+      QueueManagerHolder.getInstance(context)
+  }
   private val progressChannels = mutableMapOf<String, EventChannel.EventSink>()
   private val uploadProgressChannels = mutableMapOf<String, EventChannel>()
   private val downloadProgressChannels = mutableMapOf<String, EventChannel>()
@@ -86,9 +90,13 @@ class BackgroundTransferPlugin: FlutterPlugin, MethodCallHandler, ActivityAware 
       "startUpload" -> handleStartUpload(call, result)
       "getDownloadProgress" -> handleGetProgress(call, result, "download")
       "getUploadProgress" -> handleGetProgress(call, result, "upload")
+      "configureQueue" -> handleConfigureQueue(call, result)
+      "getQueueStatus" -> handleGetQueueStatus(call, result)
+      "getQueuedTransfers" -> handleGetQueuedTransfers(call, result)
       "isDownloadComplete" -> handleIsComplete(call, result, "download")
       "isUploadComplete" -> handleIsComplete(call, result, "upload")
       "cancelTask" -> handleCancelTask(call, result)
+      "deleteTask" -> handleDeleteTask(call, result)
       "getPlatformVersion" -> {
         result.success("Android " + android.os.Build.VERSION.RELEASE)
       }
@@ -109,6 +117,15 @@ class BackgroundTransferPlugin: FlutterPlugin, MethodCallHandler, ActivityAware 
       return
     }
     val headers = call.argument<Map<String, String>>("headers") ?: emptyMap()
+    val details = TransferQueueManager.TransferDetails(
+        type = "download",
+        url = fileUrl,
+        path = outputPath,
+        createdAt = Date(),
+        progress = 0.0f,
+        status = "queued",
+        fields = emptyMap() // Downloads don't have fields
+    )
     
     val data = workDataOf(
       "file_url" to fileUrl,
@@ -141,9 +158,10 @@ class BackgroundTransferPlugin: FlutterPlugin, MethodCallHandler, ActivityAware 
         }
       }
     
-    WorkManager.getInstance(context).enqueue(downloadRequest)
-    Log.i(TAG, "Download started with taskId: ${downloadRequest.id}")
-    result.success(downloadRequest.id.toString())
+    val taskId = downloadRequest.id.toString()
+    queueManager.enqueueTransfer("download", taskId, downloadRequest, details)
+    Log.i(TAG, "Download started with taskId: $taskId")
+    result.success(taskId)
   }
 
   private fun handleStartUpload(call: MethodCall, result: Result) {
@@ -160,6 +178,16 @@ class BackgroundTransferPlugin: FlutterPlugin, MethodCallHandler, ActivityAware 
     }
     val headers = call.argument<Map<String, String>>("headers") ?: emptyMap()
     val fields = call.argument<Map<String, String>>("fields") ?: emptyMap()
+    
+    val details = TransferQueueManager.TransferDetails(
+        type = "upload",
+        url = uploadUrl,
+        path = filePath,
+        createdAt = Date(),
+        progress = 0.0f,
+        status = "queued",
+        fields = fields  // Only include form fields for uploads, not headers
+    )
     
     val data = workDataOf(
       "file_path" to filePath,
@@ -194,9 +222,10 @@ class BackgroundTransferPlugin: FlutterPlugin, MethodCallHandler, ActivityAware 
         }
       }
     
-    WorkManager.getInstance(context).enqueue(uploadRequest)
-    Log.i(TAG, "Upload started with taskId: ${uploadRequest.id}")
-    result.success(uploadRequest.id.toString())
+    val taskId = uploadRequest.id.toString()
+    queueManager.enqueueTransfer("upload", taskId, uploadRequest, details)
+    Log.i(TAG, "Upload started with taskId: $taskId")
+    result.success(taskId)
   }
 
   private fun handleGetProgress(call: MethodCall, result: Result, type: String) {
@@ -282,8 +311,7 @@ class BackgroundTransferPlugin: FlutterPlugin, MethodCallHandler, ActivityAware 
       result.error("INVALID_ARGUMENTS", "Task ID is required", null)
       return
     }
-    val prefs = context.getSharedPreferences("${type}_prefs", Context.MODE_PRIVATE)
-    val isComplete = prefs.getInt("${type}_progress_$taskId", 0) >= 100
+    val isComplete = queueManager.isTaskComplete(taskId)
     Log.d(TAG, "Task $taskId completion status: $isComplete")
     result.success(isComplete)
   }
@@ -305,6 +333,56 @@ class BackgroundTransferPlugin: FlutterPlugin, MethodCallHandler, ActivityAware 
     
     // Cancel the work
     WorkManager.getInstance(context).cancelWorkById(UUID.fromString(taskId))
+    result.success(true)
+  }
+
+  private fun handleConfigureQueue(call: MethodCall, result: Result) {
+    val isEnabled = call.argument<Boolean>("isEnabled") ?: run {
+      Log.e(TAG, "Missing isEnabled argument")
+      result.error("INVALID_ARGUMENTS", "isEnabled is required", null)
+      return
+    }
+    val maxConcurrent = call.argument<Int>("maxConcurrent") ?: 1
+    val cleanupDelay = (call.argument<Double>("cleanupDelay") ?: 0.0).toLong() // Already in milliseconds from Dart
+
+    queueManager.configureQueue(isEnabled, maxConcurrent, cleanupDelay)
+    result.success(null)
+  }
+
+  private fun handleGetQueueStatus(call: MethodCall, result: Result) {
+    result.success(queueManager.getQueueStatus())
+  }
+
+  private fun handleGetQueuedTransfers(call: MethodCall, result: Result) {
+    val transfers = queueManager.getQueuedTransfers()
+    Log.d(TAG, "Queued transfers: ${transfers.size} items")
+    transfers.forEach { transfer ->
+      Log.d(TAG, "Transfer: $transfer")
+    }
+    result.success(transfers)
+  }
+
+  private fun handleDeleteTask(call: MethodCall, result: Result) {
+    val taskId = call.argument<String>("task_id") ?: run {
+      Log.e(TAG, "Missing task_id argument")
+      result.error("INVALID_ARGUMENTS", "Task ID is required", null)
+      return
+    }
+    Log.i(TAG, "Deleting task: $taskId")
+
+    // First cancel any active work
+    WorkManager.getInstance(context).cancelWorkById(UUID.fromString(taskId))
+
+    // Clean up resources in queue manager
+    queueManager.deleteTask(taskId)
+
+    // Clean up any progress channels
+    progressChannels.remove(taskId)?.let { events ->
+      events.endOfStream()
+    }
+    uploadProgressChannels.remove(taskId)?.setStreamHandler(null)
+    downloadProgressChannels.remove(taskId)?.setStreamHandler(null)
+
     result.success(true)
   }
 

@@ -85,6 +85,7 @@ class FileDownloadWorker(
                     .putInt("download_progress_${id}", 0)
                     .apply()
 
+                var lastProgress = 0
                 file.sink().buffer().use { sink ->
                     responseBody.source().use { source ->
                         val buffer = Buffer()
@@ -100,19 +101,26 @@ class FileDownloadWorker(
                                 0
                             }
                             
-                            // Update progress in SharedPreferences
-                            context.getSharedPreferences("download_prefs", Context.MODE_PRIVATE)
-                                .edit()
-                                .putInt("download_progress_${id}", progress)
-                                .apply()
-                            
-                            notificationHelper.updateProgressNotification("download", id.toString(), progress)
-                            setProgressAsync(Data.Builder()
-                                .putInt("progress", progress)
-                                .build())
-
-                            if (progress >= 100) {
-                                notificationHelper.showCompleteNotification("download", id.toString())
+                            if (progress != lastProgress) {
+                                // Update progress in SharedPreferences
+                                context.getSharedPreferences("download_prefs", Context.MODE_PRIVATE)
+                                    .edit()
+                                    .putInt("download_progress_${id}", progress)
+                                    .apply()
+                                
+                                // Update progress via preferences since we don't have direct access to QueueManager
+                                context.getSharedPreferences("transfer_progress", Context.MODE_PRIVATE)
+                                    .edit()
+                                    .putFloat("progress_${id}", progress / 100.0f)
+                                    .apply()
+                                
+                                setProgressAsync(Data.Builder()
+                                    .putInt("progress", progress)
+                                    .build())
+                                    
+                                notificationHelper.updateProgressNotification("download", id.toString(), progress)
+                                
+                                lastProgress = progress
                             }
                         }
                     }

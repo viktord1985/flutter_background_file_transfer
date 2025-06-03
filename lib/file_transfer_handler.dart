@@ -18,6 +18,23 @@ import 'dart:async';
 /// * iOS: Uses URLSession background transfer capabilities
 /// * Android: Uses WorkManager for reliable background processing
 abstract class FileTransferHandler {
+  /// Configure the transfer queue behavior
+  ///
+  /// [isEnabled] - When true, transfers will be queued and processed according to [maxConcurrent].
+  /// When false, transfers will start immediately without queueing.
+  ///
+  /// [maxConcurrent] - The maximum number of concurrent transfers allowed when queue is enabled.
+  /// Default is 1, which processes transfers serially.
+  ///
+  /// [cleanupDelay] - The delay in milliseconds before removing completed tasks from the queue.
+  /// Default is 0, which means tasks are removed immediately when completed.
+  /// Note: On iOS, this value will be automatically converted from milliseconds to seconds internally.
+  Future<void> configureQueue({
+    required bool isEnabled,
+    int maxConcurrent = 1,
+    double cleanupDelay = 0,
+  });
+
   /// Starts a file download operation in the background.
   ///
   /// The download continues even if the app moves to the background.
@@ -105,4 +122,17 @@ abstract class FileTransferHandler {
   ///
   /// Returns true if the task was successfully cancelled, false otherwise.
   Future<bool> cancelTask(String taskId);
+
+  /// Deletes a task from the queue and cleans up associated resources.
+  /// Returns true if the task was successfully deleted, false if the task wasn't found.
+  ///
+  /// Parameters:
+  /// * [taskId]: The ID of the task to delete
+  Future<bool> deleteTask(String taskId);
+
+  /// Get details about the current queue status
+  Future<Map<String, dynamic>> getQueueStatus();
+
+  /// Get list of queued transfers with their details
+  Future<List<Map<String, dynamic>>> getQueuedTransfers();
 }

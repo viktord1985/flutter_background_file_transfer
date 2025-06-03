@@ -12,14 +12,95 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
     private var streamHandlers: [String: ProgressStreamHandler] = [:]
     private var downloadTasks: [URLSessionDownloadTask] = []
     private var uploadTasks: [URLSessionUploadTask] = []
-    private var completedTasks: Set<String> = []
     private var binaryMessenger: FlutterBinaryMessenger?
     private let notificationCenter = UNUserNotificationCenter.current()
+    private var isQueueEnabled: Bool = true
+    private var maxConcurrentTransfers: Int = 1
+    private var completionCounter: Int = 0
+    private var completedTaskCleanupDelay: TimeInterval = 0 // Immediate cleanup by default
+
+    // After a task completes and its status is verified, schedule cleanup
+    private func scheduleTaskCleanup(taskId: String) {
+        if completedTaskCleanupDelay <= 0 {
+            // Remove immediately if delay is 0 or negative
+            transferDetails.removeValue(forKey: taskId)
+        } else {
+            // Schedule removal after the configured delay
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + completedTaskCleanupDelay) { [weak self] in
+                self?.transferDetails.removeValue(forKey: taskId)
+            }
+        }
+    }
+    
+    // Queue management properties
+    private var transferQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1 // Serial queue by default
+        return queue
+    }()
+    
+    // Custom Operation class for transfers
+    private class TransferOperation: Operation {
+        let taskId: String
+        let executeBlock: (@escaping () -> Void) -> Void
+        private var isTransferFinished = false
+        private let finishLock = NSLock()
+        
+        init(taskId: String, executeBlock: @escaping (@escaping () -> Void) -> Void) {
+            self.taskId = taskId
+            self.executeBlock = executeBlock
+            super.init()
+        }
+        
+        override func main() {
+            guard !isCancelled else { return }
+            
+            let semaphore = DispatchSemaphore(value: 0)
+            executeBlock {
+                self.finishLock.lock()
+                self.isTransferFinished = true
+                self.finishLock.unlock()
+                semaphore.signal()
+            }
+            
+            // Wait for transfer to complete
+            _ = semaphore.wait(timeout: .now() + 3600) // 1 hour timeout
+        }
+        
+        override var isFinished: Bool {
+            finishLock.lock()
+            let finished = isTransferFinished || isCancelled
+            finishLock.unlock()
+            return finished
+        }
+    }
+
+    private func getNextCompletionId() -> Int {
+        completionCounter += 1
+        return completionCounter
+    }
+
+    // Queue configuration method
+    private func configureTransferQueue(isEnabled: Bool, maxConcurrent: Int, cleanupDelay: TimeInterval = 0) {
+        isQueueEnabled = isEnabled
+        maxConcurrentTransfers = maxConcurrent
+        completedTaskCleanupDelay = cleanupDelay
+        transferQueue.maxConcurrentOperationCount = isEnabled ? maxConcurrent : OperationQueue.defaultMaxConcurrentOperationCount
+    }
     
     private lazy var urlSession: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: "dev.sylvestre.background_transfer")
         config.sessionSendsLaunchEvents = true
-        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        config.isDiscretionary = false // Force immediate start
+        config.shouldUseExtendedBackgroundIdleMode = true
+        
+        // iOS 13+ specific configurations
+        if #available(iOS 13.0, *) {
+            config.allowsConstrainedNetworkAccess = true
+            config.allowsExpensiveNetworkAccess = true
+        }
+        
+        return URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)  // Use main queue for callbacks
     }()
     
     public static func register(with registrar: FlutterPluginRegistrar) {
@@ -49,50 +130,109 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
         }
     }
     
-    public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        os_log("Handling method call: %{public}@", log: logger, type: .info, call.method)
-        switch call.method {
-        case "startDownload":
-            handleStartDownload(call, result: result)
-        case "startUpload":
-            handleStartUpload(call, result: result)
-        case "getDownloadProgress":
-            handleGetProgress(call, result: result, type: "download")
-        case "getUploadProgress":
-            handleGetProgress(call, result: result, type: "upload")
-        case "isDownloadComplete":
-            handleIsComplete(call, result: result, type: "download")
-        case "isUploadComplete":
-            handleIsComplete(call, result: result, type: "upload")
-        case "cancelTask":
-            handleCancelTask(call, result: result)
-        default:
-            result(FlutterMethodNotImplemented)
+    private func enqueueTransfer(taskId: String, operation: @escaping (@escaping () -> Void) -> Void) {
+        if isQueueEnabled {
+            let transferOp = TransferOperation(taskId: taskId, executeBlock: operation)
+            transferQueue.addOperation(transferOp)
+        } else {
+            operation { }
         }
     }
     
     private func handleStartDownload(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        os_log("Starting download", log: logger, type: .info)
         guard let args = call.arguments as? [String: Any],
               let fileUrl = args["file_url"] as? String,
               let outputPath = args["output_path"] as? String else {
-            os_log("Missing arguments for download", log: logger, type: .error)
             result(FlutterError(code: "MISSING_ARGUMENTS", message: "file_url and output_path are required", details: nil))
             return
         }
         
-        var headers = [String: String]()
-        if let headersAny = args["headers"] {
-            if let headersDict = headersAny as? [String: String] {
-                headers = headersDict
-            } else {
-                result(FlutterError(code: "INVALID_HEADERS", message: "headers must be a dictionary of String:String", details: nil))
+        let headers = args["headers"] as? [String: String] ?? [:]
+        startDownloadTask(fileUrl: fileUrl, outputPath: outputPath, headers: headers, result: result)
+    }
+    
+    private struct TransferDetails {
+        let type: String
+        let url: String
+        let path: String
+        let createdAt: Date
+        var progress: Float
+        var status: String
+        let fields: [String: String]
+        
+        func toDictionary() -> [String: Any] {
+            var dict: [String: Any] = [
+                "type": type,
+                "url": url,
+                "path": path,
+                "createdAt": ISO8601DateFormatter().string(from: createdAt),
+                "progress": progress,
+                "status": status
+            ]
+            // Add all custom fields
+            fields.forEach { key, value in
+                dict[key] = value
+            }
+            return dict
+        }
+    }
+    
+    private var transferDetails: [String: TransferDetails] = [:]
+    
+    private func startDownloadTask(fileUrl: String, outputPath: String, headers: [String: String], result: @escaping FlutterResult) {
+        let taskId = UUID().uuidString
+        
+        // Record transfer details
+        transferDetails[taskId] = TransferDetails(
+            type: "download",
+            url: fileUrl,
+            path: outputPath,
+            createdAt: Date(),
+            progress: 0.0,
+            status: "queued",
+            fields: [:]  // Empty fields for downloads
+        )
+        
+        enqueueTransfer(taskId: taskId) { [weak self] completion in
+            guard let self = self,
+                  let url = URL(string: fileUrl) else {
+                completion()
                 return
             }
+            
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 3600 // 1 hour timeout
+            
+            // Add headers
+            headers.forEach { key, value in
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+            
+            // Create and configure download task
+            let completionId = self.getNextCompletionId()
+            let downloadTask = self.urlSession.downloadTask(with: request)
+            downloadTask.taskDescription = "download|\(taskId)|\(outputPath)|\(completionId)"
+            downloadTask.priority = URLSessionTask.highPriority
+            
+            os_log("Starting download task %{public}@ for URL: %{public}@", log: logger, type: .debug, taskId, fileUrl)
+            
+            // Store completion handler
+            self.taskCompletions[downloadTask.taskDescription ?? ""] = completion
+            
+            // Update status before starting
+            if var details = self.transferDetails[taskId] {
+                details.status = "active"
+                self.transferDetails[taskId] = details
+            }
+            
+            // Add to active tasks and start
+            self.downloadTasks.append(downloadTask)
+            downloadTask.resume()
+            
+            self.showTransferStartNotification(type: "download", taskId: taskId)
         }
         
-        let taskId = startDownload(fileUrl: fileUrl, outputPath: outputPath, headers: headers)
-        os_log("Download started with taskId: %{public}@", log: logger, type: .info, taskId)
         result(taskId)
     }
     
@@ -100,254 +240,413 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
         guard let args = call.arguments as? [String: Any],
               let filePath = args["file_path"] as? String,
               let uploadUrl = args["upload_url"] as? String else {
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Invalid arguments", details: nil))
+            result(FlutterError(code: "MISSING_ARGUMENTS", message: "file_path and upload_url are required", details: nil))
             return
         }
         
         let headers = args["headers"] as? [String: String] ?? [:]
         let fields = args["fields"] as? [String: String] ?? [:]
+        startUploadTask(filePath: filePath, uploadUrl: uploadUrl, headers: headers, fields: fields, result: result)
+    }
+    
+    private func startUploadTask(filePath: String, uploadUrl: String, headers: [String: String], fields: [String: String], result: @escaping FlutterResult) {
+        let taskId = UUID().uuidString
         
-        let taskId = startUpload(filePath: filePath, uploadUrl: uploadUrl, headers: headers, fields: fields)
+        transferDetails[taskId] = TransferDetails(
+            type: "upload",
+            url: uploadUrl,
+            path: filePath,
+            createdAt: Date(),
+            progress: 0.0,
+            status: "queued",
+            fields: fields
+        )
+        
+        enqueueTransfer(taskId: taskId) { [weak self] completion in
+            guard let self = self,
+                  let url = URL(string: uploadUrl),
+                  url.scheme != nil else {
+                self?.showTransferCompleteNotification(type: "upload", taskId: taskId, 
+                    error: NSError(domain: "BackgroundTransferPlugin", code: -1002, 
+                                 userInfo: [NSLocalizedDescriptionKey: "Invalid upload URL"]))
+                completion()
+                return
+            }
+            
+            // Create file URL and validate
+            let fileUrl: URL
+            if filePath.hasPrefix("file://") {
+                guard let url = URL(string: filePath) else {
+                    self.showTransferCompleteNotification(type: "upload", taskId: taskId, 
+                        error: NSError(domain: "BackgroundTransferPlugin", code: -1002, 
+                                     userInfo: [NSLocalizedDescriptionKey: "Invalid file URL"]))
+                    completion()
+                    return
+                }
+                fileUrl = url
+            } else {
+                fileUrl = URL(fileURLWithPath: filePath)
+            }
+            
+            guard FileManager.default.fileExists(atPath: fileUrl.path),
+                  FileManager.default.isReadableFile(atPath: fileUrl.path) else {
+                self.showTransferCompleteNotification(type: "upload", taskId: taskId,
+                    error: NSError(domain: "BackgroundTransferPlugin", code: -1002,
+                                 userInfo: [NSLocalizedDescriptionKey: "File not found or not readable"]))
+                completion()
+                return
+            }
+            
+            do {
+                // Create a temporary file for the multipart form data
+                let temporaryDir = FileManager.default.temporaryDirectory
+                let formDataFile = temporaryDir.appendingPathComponent("upload_\(taskId)_form")
+                
+                // Create multipart form data
+                let boundary = "Boundary-\(UUID().uuidString)"
+                var formData = Data()
+                
+                // Add form fields
+                for (key, value) in fields {
+                    formData.append("--\(boundary)\r\n".data(using: .utf8)!)
+                    formData.append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".data(using: .utf8)!)
+                    formData.append("\(value)\r\n".data(using: .utf8)!)
+                }
+                
+                // Add file part header
+                formData.append("--\(boundary)\r\n".data(using: .utf8)!)
+                formData.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileUrl.lastPathComponent)\"\r\n".data(using: .utf8)!)
+                formData.append("Content-Type: application/octet-stream\r\n\r\n".data(using: .utf8)!)
+                
+                // Write initial form data
+                try formData.write(to: formDataFile)
+                
+                // Append file data in chunks
+                if let fileHandle = FileHandle(forWritingAtPath: formDataFile.path),
+                   let inputFileHandle = FileHandle(forReadingAtPath: fileUrl.path) {
+                    fileHandle.seekToEndOfFile()
+                    
+                    while true {
+                        let data = inputFileHandle.readData(ofLength: 1024 * 1024)
+                        if data.count == 0 { break }
+                        fileHandle.write(data)
+                    }
+                    
+                    // Write final boundary
+                    if let finalBoundaryData = "\r\n--\(boundary)--\r\n".data(using: .utf8) {
+                        fileHandle.write(finalBoundaryData)
+                    }
+                    
+                    fileHandle.closeFile()
+                    inputFileHandle.closeFile()
+                }
+                
+                // Create and configure upload request
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.timeoutInterval = 3600 // 1 hour timeout
+                request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+                
+                // Add custom headers
+                headers.forEach { key, value in
+                    request.setValue(value, forHTTPHeaderField: key)
+                }
+                
+                // Create and configure upload task
+                let completionId = self.getNextCompletionId()
+                let uploadTask = self.urlSession.uploadTask(with: request, fromFile: formDataFile)
+                uploadTask.taskDescription = "upload|\(taskId)|\(filePath)|\(completionId)"
+                uploadTask.priority = URLSessionTask.highPriority
+                
+                os_log("Starting upload task %{public}@ for URL: %{public}@", log: logger, type: .debug, taskId, uploadUrl)
+                
+                // Store completion handler
+                self.taskCompletions[uploadTask.taskDescription ?? ""] = completion
+                
+                // Update status before starting
+                if var details = self.transferDetails[taskId] {
+                    details.status = "active"
+                    self.transferDetails[taskId] = details
+                }
+                
+                // Add to active tasks and start
+                self.uploadTasks.append(uploadTask)
+                uploadTask.resume()
+                
+                self.showTransferStartNotification(type: "upload", taskId: taskId)
+                
+                // Schedule cleanup of temporary file
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 300) {
+                    try? FileManager.default.removeItem(at: formDataFile)
+                }
+            } catch {
+                os_log("Error preparing upload: %{public}@", log: logger, type: .error, error.localizedDescription)
+                self.showTransferCompleteNotification(type: "upload", taskId: taskId, error: error)
+                completion()
+            }
+        }
+        
         result(taskId)
     }
     
     private func handleGetProgress(_ call: FlutterMethodCall, result: @escaping FlutterResult, type: String) {
-        os_log("Setting up progress tracking for %{public}@", log: logger, type: .info, type)
         guard let args = call.arguments as? [String: Any],
               let taskId = args["task_id"] as? String,
               let messenger = binaryMessenger else {
-            os_log("Invalid arguments or messenger not available for progress tracking", log: logger, type: .error)
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Task ID is required", details: nil))
+            result(FlutterError(code: "MISSING_ARGUMENTS", message: "task_id is required", details: nil))
             return
         }
-
+        
         let channelName = "background_transfer/\(type)_progress_\(taskId)"
+        os_log("Setting up progress channel: %{public}@", log: logger, type: .debug, channelName)
+        
         let eventChannel = FlutterEventChannel(name: channelName, binaryMessenger: messenger)
-        let streamHandler = ProgressStreamHandler()
+        let streamHandler = ProgressStreamHandler(taskId: taskId)
         streamHandlers[taskId] = streamHandler
         eventChannel.setStreamHandler(streamHandler)
         eventChannels[taskId] = eventChannel
         
+        os_log("Progress channel setup complete for task: %{public}@", log: logger, type: .debug, taskId)
         result(nil)
     }
     
     private func handleIsComplete(_ call: FlutterMethodCall, result: @escaping FlutterResult, type: String) {
         guard let args = call.arguments as? [String: Any],
               let taskId = args["task_id"] as? String else {
-            result(false)
+            result(FlutterError(code: "MISSING_ARGUMENTS", message: "task_id is required", details: nil))
             return
         }
-        result(completedTasks.contains(taskId))
+        
+        if let details = transferDetails[taskId] {
+            result(details.status == "completed")
+        } else {
+            result(false)
+        }
     }
     
     private func handleCancelTask(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         guard let args = call.arguments as? [String: Any],
               let taskId = args["task_id"] as? String else {
-            result(false)
+            result(FlutterError(code: "MISSING_ARGUMENTS", message: "task_id is required", details: nil))
             return
         }
         
+        os_log("Cancelling task %{public}@", log: logger, type: .debug, taskId)
+        
+        // Cancel any queued operations first
+        var operationFound = false
+        if isQueueEnabled {
+            transferQueue.operations.forEach { operation in
+                if let transferOp = operation as? TransferOperation, transferOp.taskId == taskId {
+                    operation.cancel()
+                    operationFound = true
+                }
+            }
+        }
+        
+        // Cancel active download task if exists
+        var downloadTaskFound = false
         if let downloadTask = downloadTasks.first(where: { $0.taskDescription?.contains(taskId) ?? false }) {
             downloadTask.cancel()
             downloadTasks.removeAll { $0.taskDescription?.contains(taskId) ?? false }
+            downloadTaskFound = true
         }
         
+        // Cancel active upload task if exists
+        var uploadTaskFound = false
         if let uploadTask = uploadTasks.first(where: { $0.taskDescription?.contains(taskId) ?? false }) {
             uploadTask.cancel()
             uploadTasks.removeAll { $0.taskDescription?.contains(taskId) ?? false }
+            uploadTaskFound = true
         }
+        
+        // Update transfer details and mark as cancelled
+        if var details = transferDetails[taskId] {
+            let type = details.type
+            details.status = "cancelled"
+            details.progress = 0.0
+            transferDetails[taskId] = details
+            
+            // Clean up any temporary files for uploads
+            if type == "upload" {
+                let temporaryDir = FileManager.default.temporaryDirectory
+                let formDataFile = temporaryDir.appendingPathComponent("upload_\(taskId)_form")
+                try? FileManager.default.removeItem(at: formDataFile)
+            }
+            
+            // Schedule immediate cleanup for cancelled task
+            scheduleTaskCleanup(taskId: taskId)
+            
+            // Show cancellation notification
+            showCancelNotification(type: type, taskId: taskId)
+        }
+        
+        // Clean up event handlers and progress tracking
+        cleanupEventHandlers(forTaskId: taskId)
+        
+        // Clean up any completion handlers
+        cleanupCompletionHandlers(forTaskId: taskId)
+        
+        // Log cancellation status
+        os_log("Task %{public}@ cancelled: operation=%{public}@, download=%{public}@, upload=%{public}@", 
+               log: logger, 
+               type: .debug, 
+               taskId, 
+               String(describing: operationFound), 
+               String(describing: downloadTaskFound), 
+               String(describing: uploadTaskFound))
         
         result(true)
     }
     
-    private func startDownload(fileUrl: String, outputPath: String, headers: [String: String]) -> String {
-        guard let url = URL(string: fileUrl) else { return "" }
-        
-        var request = URLRequest(url: url)
-        headers.forEach { key, value in
-            request.setValue(value, forHTTPHeaderField: key)
-        }
-        
-        let taskId = UUID().uuidString
-        let downloadTask = urlSession.downloadTask(with: request)
-        downloadTask.taskDescription = "download|\(taskId)|\(outputPath)"
-        downloadTask.resume()
-        downloadTasks.append(downloadTask)
-        
-        showTransferStartNotification(type: "download", taskId: taskId)
-        
-        return taskId
+    private func cleanupEventHandlers(forTaskId taskId: String) {
+        streamHandlers.removeValue(forKey: taskId)
+        eventChannels.removeValue(forKey: taskId)?.setStreamHandler(nil)
+        progressChannels.removeValue(forKey: taskId)
     }
-    
-    private func startUpload(filePath: String, uploadUrl: String, headers: [String: String], fields: [String: String]) -> String {
-        // Validate URLs and create proper file URL
-        guard let url = URL(string: uploadUrl),
-              url.scheme != nil else {
-            os_log("Invalid upload URL (missing scheme): %{public}@", log: logger, type: .error, uploadUrl)
-            let taskId = UUID().uuidString
-            showTransferCompleteNotification(type: "upload", taskId: taskId, error: NSError(domain: "BackgroundTransferPlugin", code: -1002, userInfo: [NSLocalizedDescriptionKey: "Invalid upload URL - must include http:// or https://"]))
-            return taskId
-        }
-        
-        // Convert file path to proper URL, handling both absolute paths and file:// URLs
-        let fileUrl: URL
-        if filePath.hasPrefix("file://") {
-            guard let url = URL(string: filePath) else {
-                let taskId = UUID().uuidString
-                showTransferCompleteNotification(type: "upload", taskId: taskId, error: NSError(domain: "BackgroundTransferPlugin", code: -1002, userInfo: [NSLocalizedDescriptionKey: "Invalid file URL"]))
-                return taskId
-            }
-            fileUrl = url
-        } else {
-            fileUrl = URL(fileURLWithPath: filePath)
-        }
-        
-        // Verify file exists and is readable
-        guard FileManager.default.fileExists(atPath: fileUrl.path),
-              FileManager.default.isReadableFile(atPath: fileUrl.path) else {
-            os_log("File does not exist or is not readable: %{public}@", log: logger, type: .error, fileUrl.path)
-            let taskId = UUID().uuidString
-            showTransferCompleteNotification(type: "upload", taskId: taskId, error: NSError(domain: "BackgroundTransferPlugin", code: -1002, userInfo: [NSLocalizedDescriptionKey: "File not found or not readable"]))
-            return taskId
-        }
 
-        let taskId = UUID().uuidString
-        
-        do {
-            // Create a temporary file for the multipart form data
-            let temporaryDir = FileManager.default.temporaryDirectory
-            let formDataFile = temporaryDir.appendingPathComponent("upload_\(taskId)_form")
-            var formData = Data()
-            
-            let boundary = "Boundary-\(UUID().uuidString)"
-            
-            // Add form fields to the temporary file
-            for (key, value) in fields {
-                formData.append("--\(boundary)\r\n".data(using: .utf8)!)
-                formData.append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".data(using: .utf8)!)
-                formData.append("\(value)\r\n".data(using: .utf8)!)
+    private func cleanupCompletionHandlers(forTaskId taskId: String) {
+        downloadTasks.forEach { task in
+            if let description = task.taskDescription, description.contains(taskId) {
+                taskCompletions.removeValue(forKey: description)
             }
-            
-            // Add file part header
-            formData.append("--\(boundary)\r\n".data(using: .utf8)!)
-            formData.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileUrl.lastPathComponent)\"\r\n".data(using: .utf8)!)
-            formData.append("Content-Type: application/octet-stream\r\n\r\n".data(using: .utf8)!)
-            
-            // Write the initial form data to the temporary file
-            try formData.write(to: formDataFile)
-            
-            // Append file data using older FileHandle APIs with proper optional handling
-            if let fileHandle = FileHandle(forWritingAtPath: formDataFile.path) {
-                fileHandle.seekToEndOfFile()
-                
-                if let inputFileHandle = FileHandle(forReadingAtPath: fileUrl.path) {
-                    // Read and write in chunks using older APIs with proper optional handling
-                    while true {
-                        let data = inputFileHandle.readData(ofLength: 1024 * 1024)
-                        if data.count == 0 {
-                            break
-                        }
-                        fileHandle.write(data)
-                    }
-                    
-                    inputFileHandle.closeFile()
-                }
-                
-                // Write final boundary
-                if let finalBoundaryData = "\r\n--\(boundary)--\r\n".data(using: .utf8) {
-                    fileHandle.write(finalBoundaryData)
-                }
-                fileHandle.closeFile()
-            }
-            
-            // Create and configure the upload request
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-            
-            // Add custom headers
-            for (key, value) in headers {
-                request.setValue(value, forHTTPHeaderField: key)
-            }
-            
-            // Create the upload task using the temporary file
-            let uploadTask = urlSession.uploadTask(with: request, fromFile: formDataFile)
-            uploadTask.taskDescription = "upload|\(taskId)|\(filePath)"
-            uploadTask.resume()
-            uploadTasks.append(uploadTask)
-            
-            showTransferStartNotification(type: "upload", taskId: taskId)
-            
-            // Schedule cleanup of temporary file
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 300) { // Clean up after 5 minutes
-                try? FileManager.default.removeItem(at: formDataFile)
-            }
-            
-        } catch {
-            os_log("Error preparing upload: %{public}@", log: logger, type: .error, error.localizedDescription)
-            showTransferCompleteNotification(type: "upload", taskId: taskId, error: error)
         }
+        uploadTasks.forEach { task in 
+            if let description = task.taskDescription, description.contains(taskId) {
+                taskCompletions.removeValue(forKey: description)
+            }
+        }
+    }
+
+    private func showCancelNotification(type: String, taskId: String) {
+        let content = UNMutableNotificationContent()
+        content.title = type == "download" ? "Download Cancelled" : "Upload Cancelled"
+        content.body = type == "download" ? "Your download was cancelled" : "Your upload was cancelled"
+        content.sound = .default
         
-        return taskId
+        let request = UNNotificationRequest(identifier: "\(type)_cancel_\(taskId)", 
+                                          content: content, 
+                                          trigger: nil)
+        
+        notificationCenter.add(request) { error in
+            if let error = error {
+                os_log("Error showing cancel notification: %{public}@", log: logger, type: .error, error.localizedDescription)
+            }
+        }
     }
     
     // URLSession delegate methods for handling progress and completion
+    // Dictionary to store completion handlers
+    private var taskCompletions: [String: () -> Void] = [:]
+    
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard let taskDescription = downloadTask.taskDescription else { return }
         let components = taskDescription.split(separator: "|").map(String.init)
-        guard components.count == 3 else { return }
+        guard components.count == 4 else { return }
         
         let taskId = components[1]
         let outputPath = components[2]
+        let completionKey = taskDescription
         
         do {
             let destinationURL = URL(fileURLWithPath: outputPath)
             try FileManager.default.moveItem(at: location, to: destinationURL)
-            completedTasks.insert(taskId)
+            // Update status to completed
+            if var details = transferDetails[taskId] {
+                details.status = "completed"
+                transferDetails[taskId] = details
+            }
             showTransferCompleteNotification(type: "download", taskId: taskId)
         } catch {
             os_log("Error moving downloaded file: %{public}@", log: logger, type: .error, error.localizedDescription)
             showTransferCompleteNotification(type: "download", taskId: taskId, error: error)
         }
+        
+        // Call completion handler
+        taskCompletions[completionKey]?()
+        taskCompletions.removeValue(forKey: completionKey)
     }
     
     public func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
         guard let taskDescription = task.taskDescription else { return }
         let components = taskDescription.split(separator: "|").map(String.init)
-        guard components.count == 3 else { return }
+        guard components.count >= 4 else { return }  // Updated from 3 to 4
         
         let taskId = components[1]
         let progress = Float(totalBytesSent) / Float(totalBytesExpectedToSend)
-        streamHandlers[taskId]?.sendProgress(progress)
+        
+        os_log("Upload progress: %{public}f for task %{public}@", log: logger, type: .debug, progress, taskId)
+        
+        DispatchQueue.main.async {
+            self.updateTransferProgress(taskId: taskId, progress: progress)
+            self.streamHandlers[taskId]?.sendProgress(progress)
+        }
     }
     
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         guard let taskDescription = downloadTask.taskDescription else { return }
         let components = taskDescription.split(separator: "|").map(String.init)
-        guard components.count == 3 else { return }
+        guard components.count >= 4 else { return }  // Updated from 3 to 4
         
         let taskId = components[1]
         let progress = Float(totalBytesWritten) / Float(totalBytesExpectedToWrite)
-        streamHandlers[taskId]?.sendProgress(progress)
+        
+        os_log("Download progress: %{public}f for task %{public}@", log: logger, type: .debug, progress, taskId)
+        
+        DispatchQueue.main.async {
+            self.updateTransferProgress(taskId: taskId, progress: progress)
+            self.streamHandlers[taskId]?.sendProgress(progress)
+        }
+    }
+    
+    private func updateTransferProgress(taskId: String, progress: Float) {
+        if var details = transferDetails[taskId] {
+            details.progress = progress
+            transferDetails[taskId] = details
+            os_log("Updated progress for task %{public}@: %{public}f", log: logger, type: .debug, taskId, progress)
+        }
     }
     
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let taskDescription = task.taskDescription else { return }
         let components = taskDescription.split(separator: "|").map(String.init)
-        guard components.count == 3 else { return }
+        guard components.count >= 2 else { return }
         
         let type = components[0]
         let taskId = components[1]
+        let completionKey = taskDescription
         
         if let error = error {
             os_log("Transfer failed: %{public}@", log: logger, type: .error, error.localizedDescription)
+            if var details = transferDetails[taskId] {
+                details.status = "failed"
+                transferDetails[taskId] = details
+            }
             showTransferCompleteNotification(type: type, taskId: taskId, error: error)
-        } else if type == "upload" {
-            completedTasks.insert(taskId)
-            showTransferCompleteNotification(type: type, taskId: taskId)
+        } else {
+            os_log("Transfer completed successfully: %{public}@", log: logger, type: .debug, taskId)
+            // For uploads, we mark completion here. Downloads are marked in didFinishDownloadingTo
+            if type == "upload" {
+                if var details = transferDetails[taskId] {
+                    details.status = "completed"
+                    transferDetails[taskId] = details
+                }
+                showTransferCompleteNotification(type: type, taskId: taskId)
+            }
         }
+        
+        // Schedule cleanup for both success and failure cases
+        // For downloads, this will be called again in didFinishDownloadingTo, but that's okay
+        // because scheduleTaskCleanup is idempotent
+        scheduleTaskCleanup(taskId: taskId)
+        
+        // Call completion handler
+        taskCompletions[completionKey]?()
+        taskCompletions.removeValue(forKey: completionKey)
     }
     
+
+
     private func showTransferStartNotification(type: String, taskId: String) {
         let content = UNMutableNotificationContent()
         content.title = type == "download" ? "Download Started" : "Upload Started"
@@ -402,24 +701,118 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
         // Handle notification response when user taps on it
         completionHandler()
     }
+    
+    public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        switch call.method {
+        case "startDownload":
+            handleStartDownload(call, result: result)
+        case "startUpload":
+            handleStartUpload(call, result: result)
+        case "getDownloadProgress":
+            handleGetProgress(call, result: result, type: "download")
+        case "getUploadProgress":
+            handleGetProgress(call, result: result, type: "upload")
+        case "isDownloadComplete":
+            handleIsComplete(call, result: result, type: "download")
+        case "isUploadComplete":
+            handleIsComplete(call, result: result, type: "upload")
+        case "cancelTask":
+            handleCancelTask(call, result: result)
+        case "deleteTask":
+            handleDeleteTask(call, result: result)
+        case "configureQueue":
+            handleConfigureQueue(call, result: result)
+        case "getQueueStatus":
+            handleGetQueueStatus(result)
+        case "getQueuedTransfers":
+            handleGetQueuedTransfers(result)
+        default:
+            result(FlutterMethodNotImplemented)
+        }
+    }
+    private func handleConfigureQueue(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let isEnabled = args["isEnabled"] as? Bool else {
+            result(FlutterError(code: "MISSING_ARGUMENTS", message: "isEnabled is required", details: nil))
+            return
+        }
+        let maxConcurrent = args["maxConcurrent"] as? Int ?? 1
+        let cleanupDelay = args["cleanupDelay"] as? Double ?? 0
+        configureTransferQueue(isEnabled: isEnabled, maxConcurrent: maxConcurrent, cleanupDelay: cleanupDelay)
+        result(nil)
+    }
+    
+    private func handleGetQueueStatus(_ result: @escaping FlutterResult) {
+        let status: [String: Any] = [
+            "isEnabled": isQueueEnabled,
+            "maxConcurrent": maxConcurrentTransfers,
+            "activeCount": transferQueue.operationCount,
+            "queuedCount": transferQueue.operations.count - transferQueue.operationCount
+        ]
+        result(status)
+    }
+    
+    private func handleGetQueuedTransfers(_ result: @escaping FlutterResult) {
+        let transfers = transferDetails.map { (taskId, details) -> [String: Any] in
+            var transfer = details.toDictionary()
+            transfer["taskId"] = taskId
+            return transfer
+        }
+        result(transfers)
+    }
+
+    private func handleDeleteTask(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let taskId = args["task_id"] as? String else {
+            result(FlutterError(code: "MISSING_ARGUMENTS", message: "task_id is required", details: nil))
+            return
+        }
+        // remove the task from transferDetails if it exists and is not active
+        if let details = transferDetails[taskId] {
+            if details.status != "active" {
+                transferDetails.removeValue(forKey: taskId)
+                result(true)
+            } else {
+                result(FlutterError(code: "INVALID_STATE", 
+                                  message: "Cannot delete an active task", 
+                                  details: nil))
+            }
+        } else {
+            result(true)
+        }
+    }
 }
 
 class ProgressStreamHandler: NSObject, FlutterStreamHandler {
     private var eventSink: FlutterEventSink?
+    private let taskId: String
+    
+    init(taskId: String) {
+        self.taskId = taskId
+        super.init()
+    }
     
     func onListen(withArguments arguments: Any?, eventSink: @escaping FlutterEventSink) -> FlutterError? {
+        os_log("Progress stream listener added for task: %{public}@", log: logger, type: .debug, taskId)
         self.eventSink = eventSink
         return nil
     }
     
     func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        os_log("Progress stream cancelled for task: %{public}@", log: logger, type: .debug, taskId)
         eventSink = nil
         return nil
     }
     
     func sendProgress(_ progress: Float) {
-        DispatchQueue.main.async {
-            self.eventSink?(progress)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if let sink = self.eventSink {
+                os_log("Sending progress %{public}f for task: %{public}@", log: logger, type: .debug, progress, self.taskId)
+                sink(progress)
+            } else {
+                os_log("No event sink available for task: %{public}@", log: logger, type: .debug, self.taskId)
+            }
         }
     }
 }

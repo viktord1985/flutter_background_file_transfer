@@ -11,9 +11,17 @@ A Flutter plugin for handling background file transfers (uploads and downloads) 
 - Multipart form data upload support
 - Custom headers support
 - Automatic MIME type detection
-- Concurrent transfer support
-- Transfer cancellation support
+- Built-in native queue management system (can be disabled)
+  - Configurable concurrent transfer limits
+  - Automatic cleanup of completed transfers
+  - Task status monitoring and reporting
+  - Progress tracking during app session
+- Native platform implementations
+  - iOS: NSURLSession for background transfer capability
+  - Android: WorkManager for background processing
 - Lifecycle-aware progress tracking
+- Transfer cancellation support
+- Clean cancellation and resume functionality (within app session)
 
 ## Getting Started
 
@@ -108,6 +116,35 @@ final isComplete = await transfer.isUploadComplete(taskId);
 final isComplete = await transfer.isDownloadComplete(taskId);
 ```
 
+### Queue Management
+
+The plugin provides two approaches to queue management:
+
+1. Native Queue Management (built-in):
+```dart
+// Configure the native platform queue
+await transfer.configureQueue(
+  enabled: true,          // Enable/disable native queue management
+  maxConcurrent: 3,       // Maximum concurrent transfers when enabled
+  cleanupDelay: 5000,    // Delay before removing completed transfers (ms)
+);
+
+// If you prefer to handle queuing in Dart (e.g., using BLoC pattern),
+// you can disable the native queue:
+await transfer.configureQueue(enabled: false);
+
+// Get queue status
+final status = await transfer.getQueueStatus();
+print('Active transfers: ${status.activeCount}');
+print('Queued transfers: ${status.queuedCount}');
+
+// Get all transfers in queue
+final transfers = await transfer.getQueuedTransfers();
+for (final task in transfers) {
+  print('Task ${task.taskId}: ${task.status} (${task.progress * 100}%)');
+}
+```
+
 ## Platform Support
 
 | Android | iOS |
@@ -178,7 +215,14 @@ if #available(iOS 15.0, *) {
 
 ## Advanced Usage: Implementing Queue Management
 
-The plugin provides basic transfer capabilities but does not include queue management. Here's a suggested implementation using BLoC pattern to add queuing in your application:
+The plugin provides basic transfer capabilities with a built-in native queue management system. However, you might want to implement your own queue management at the Dart level for more control. Here's a suggested implementation using BLoC pattern that provides:
+
+- Custom queuing logic with full control over the transfer order
+- Persistence of the queue state using HydratedBloc (survives app restarts, but see note below about file persistence)
+- UI state management for transfer progress and status
+- Custom error handling and retry logic
+
+Note: When implementing your own queue management, it's recommended to disable the native queue using `configureQueue(enabled: false)` to avoid conflicts.
 
 ```dart
 // transfer_bloc.dart
@@ -536,6 +580,8 @@ Note: This is just one way to implement queuing. You can adapt this example or c
 
 ## Notes
 
+Note about file persistence: When uploading files, be aware that if the files are stored in temporary locations (like cache directories or temporary folders), these files might be deleted by the system when the app is completely terminated. Therefore, persisting transfer tasks across complete app restarts is not recommended as the source files might no longer be available when the app restarts. It's better to handle file persistence separately from transfer queue management.
+
 - Files are downloaded and uploaded in the background, allowing transfers to continue even when the app is in the background
 - Progress notifications are shown on both platforms
 - The plugin automatically handles lifecycle changes and restores progress tracking when the app is resumed
@@ -545,10 +591,6 @@ Note: This is just one way to implement queuing. You can adapt this example or c
 ## Upcoming Features
 
 Future versions will include:
-- Native queue management implementation templates
-  - iOS: Example implementation using NSURLSession with built-in queue management
-  - Android: Example implementation using WorkManager with transfer queue
-  - This will allow developers to implement queue management directly in their apps without depending on the plugin's queue system
 - Advanced retry strategies with exponential backoff
   - Configurable retry attempts with customizable delays
   - Intelligent retry based on error type (network, server, etc.)

@@ -11,6 +11,31 @@ class IosFileTransferHandler implements FileTransferHandler {
   /// The method channel used to communicate with the native iOS code.
   static const _channel = MethodChannel('background_transfer/task');
 
+  /// Configure the transfer queue behavior
+  ///
+  /// [isEnabled] - When true, transfers will be queued and processed according to [maxConcurrent].
+  /// When false, transfers will start immediately without queueing.
+  ///
+  /// [maxConcurrent] - The maximum number of concurrent transfers allowed when queue is enabled.
+  /// Default is 1, which processes transfers serially.
+  @override
+  Future<void> configureQueue({
+    required bool isEnabled,
+    int maxConcurrent = 1,
+    double cleanupDelay = 0,
+  }) async {
+    try {
+      // Convert cleanupDelay from milliseconds to seconds for iOS
+      await _channel.invokeMethod('configureQueue', {
+        'isEnabled': isEnabled,
+        'maxConcurrent': maxConcurrent,
+        'cleanupDelay': cleanupDelay / 1000.0, // Convert ms to seconds
+      });
+    } on PlatformException catch (e) {
+      throw Exception("Failed to configure queue: ${e.message}");
+    }
+  }
+
   /// Starts a file download operation in the background.
   ///
   /// [fileUrl] The URL of the file to download.
@@ -166,6 +191,50 @@ class IosFileTransferHandler implements FileTransferHandler {
           false;
     } on PlatformException {
       return false;
+    }
+  }
+
+  /// Gets the current status of the transfer queue.
+  ///
+  /// Returns a map containing the queue status information.
+  ///
+  /// Throws an [Exception] if the status retrieval fails.
+  @override
+  Future<Map<String, dynamic>> getQueueStatus() async {
+    try {
+      final status = await _channel.invokeMethod('getQueueStatus');
+      return Map<String, dynamic>.from(status);
+    } on PlatformException catch (e) {
+      throw Exception("Failed to get queue status: ${e.message}");
+    }
+  }
+
+  /// Gets a list of transfers currently in the queue.
+  ///
+  /// Returns a list of maps, each containing information about a queued transfer.
+  ///
+  /// Throws an [Exception] if the retrieval of queued transfers fails.
+  @override
+  Future<List<Map<String, dynamic>>> getQueuedTransfers() async {
+    try {
+      final transfers = await _channel.invokeMethod('getQueuedTransfers');
+      return (transfers as List)
+          .map((t) => Map<String, dynamic>.from(t))
+          .toList();
+    } on PlatformException catch (e) {
+      throw Exception("Failed to get queued transfers: ${e.message}");
+    }
+  }
+
+  @override
+  Future<bool> deleteTask(String taskId) async {
+    try {
+      return await _channel.invokeMethod('deleteTask', {
+            'task_id': taskId,
+          }) ??
+          false;
+    } on PlatformException catch (e) {
+      throw Exception("Failed to delete task: ${e.message}");
     }
   }
 }

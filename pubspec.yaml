@@ -1,6 +1,6 @@
 name: background_transfer
 description: A Flutter plugin for handling background file transfers (uploads and downloads) with progress tracking and notifications support.
-version: 1.1.1
+version: 1.2.0
 homepage: https://github.com/Sylv3str3/flutter_background_file_transfer
 
 environment:
