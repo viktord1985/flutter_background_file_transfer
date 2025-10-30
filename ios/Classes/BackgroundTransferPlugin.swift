@@ -9,7 +9,9 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
     private var methodChannel: FlutterMethodChannel?
     private var progressChannels: [String: FlutterEventSink] = [:]
     private var eventChannels: [String: FlutterEventChannel] = [:]
+    private var statusEventChannels: [String: FlutterEventChannel] = [:]
     private var streamHandlers: [String: ProgressStreamHandler] = [:]
+    private var statusHandlers: [String: StatusStreamHandler] = [:]
     private var downloadTasks: [URLSessionDownloadTask] = []
     private var uploadTasks: [URLSessionUploadTask] = []
     private var binaryMessenger: FlutterBinaryMessenger?
@@ -158,6 +160,7 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
         let createdAt: Date
         var progress: Float
         var status: String
+        var code: Int?
         let fields: [String: String]
         
         func toDictionary() -> [String: Any] {
@@ -167,7 +170,8 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
                 "path": path,
                 "createdAt": ISO8601DateFormatter().string(from: createdAt),
                 "progress": progress,
-                "status": status
+                "status": status,
+                "code": code
             ]
             // Add all custom fields
             fields.forEach { key, value in
@@ -409,6 +413,27 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
         os_log("Progress channel setup complete for task: %{public}@", log: logger, type: .debug, taskId)
         result(nil)
     }
+
+    private func handleGetStatus(_ call: FlutterMethodCall, result: @escaping FlutterResult, type: String) {
+        guard let args = call.arguments as? [String: Any],
+              let taskId = args["task_id"] as? String,
+              let messenger = binaryMessenger else {
+            result(FlutterError(code: "MISSING_ARGUMENTS", message: "task_id is required", details: nil))
+            return
+        }
+
+        let channelName = "background_transfer/\(type)_progress_\(taskId)"
+        os_log("Setting up progress channel: %{public}@", log: logger, type: .debug, channelName)
+
+        let eventChannel = FlutterEventChannel(name: channelName, binaryMessenger: messenger)
+        let statusHandler = StatusStreamHandler(taskId: taskId)
+        statusHandlers[taskId] = statusHandler
+        eventChannel.setStreamHandler(statusHandler)
+        statusEventChannels[taskId] = eventChannel
+
+        os_log("Status channel setup complete for task: %{public}@", log: logger, type: .debug, taskId)
+        result(nil)
+    }
     
     private func handleIsComplete(_ call: FlutterMethodCall, result: @escaping FlutterResult, type: String) {
         guard let args = call.arguments as? [String: Any],
@@ -501,7 +526,9 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
     
     private func cleanupEventHandlers(forTaskId taskId: String) {
         streamHandlers.removeValue(forKey: taskId)
+        statusHandlers.removeValue(forKey: taskId)
         eventChannels.removeValue(forKey: taskId)?.setStreamHandler(nil)
+        statusEventChannels.removeValue(forKey: taskId)?.setStreamHandler(nil)
         progressChannels.removeValue(forKey: taskId)
     }
 
@@ -520,8 +547,10 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
 
     private func showCancelNotification(type: String, taskId: String) {
         let content = UNMutableNotificationContent()
-        content.title = type == "download" ? "Download Cancelled" : "Upload Cancelled"
-        content.body = type == "download" ? "Your download was cancelled" : "Your upload was cancelled"
+        //content.title = type == "download" ? "Download Cancelled" : "Upload Cancelled"
+        //content.body = type == "download" ? "Your download was cancelled" : "Your upload was cancelled"
+        content.title = type == "download" ? "Stahování zrušeno" : "Nahrávání zrušeno"
+        content.body = type == "download" ? "Vaše stahování bylo zrušeno" : "Vaše nahrávání bylo zrušeno"
         content.sound = .default
         
         let request = UNNotificationRequest(identifier: "\(type)_cancel_\(taskId)", 
@@ -555,6 +584,12 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
             if var details = transferDetails[taskId] {
                 details.status = "completed"
                 transferDetails[taskId] = details
+            }
+
+             guard let httpResponse = downloadTask.response as? HTTPURLResponse else { return }
+
+            DispatchQueue.main.async {
+                self.statusHandlers[taskId]?.sendStatus(httpResponse.statusCode)
             }
             showTransferCompleteNotification(type: "download", taskId: taskId)
         } catch {
@@ -611,7 +646,9 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
         guard let taskDescription = task.taskDescription else { return }
         let components = taskDescription.split(separator: "|").map(String.init)
         guard components.count >= 2 else { return }
-        
+
+        guard let httpResponse = task.response as? HTTPURLResponse else { return }
+
         let type = components[0]
         let taskId = components[1]
         let completionKey = taskDescription
@@ -620,7 +657,11 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
             os_log("Transfer failed: %{public}@", log: logger, type: .error, error.localizedDescription)
             if var details = transferDetails[taskId] {
                 details.status = "failed"
+                details.code = httpResponse.statusCode
                 transferDetails[taskId] = details
+            }
+            DispatchQueue.main.async {
+                self.statusHandlers[taskId]?.sendStatus(httpResponse.statusCode)
             }
             showTransferCompleteNotification(type: type, taskId: taskId, error: error)
         } else {
@@ -629,7 +670,11 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
             if type == "upload" {
                 if var details = transferDetails[taskId] {
                     details.status = "completed"
+                    details.code = httpResponse.statusCode
                     transferDetails[taskId] = details
+                }
+                DispatchQueue.main.async {
+                    self.statusHandlers[taskId]?.sendStatus(httpResponse.statusCode)
                 }
                 showTransferCompleteNotification(type: type, taskId: taskId)
             }
@@ -649,8 +694,10 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
 
     private func showTransferStartNotification(type: String, taskId: String) {
         let content = UNMutableNotificationContent()
-        content.title = type == "download" ? "Download Started" : "Upload Started"
-        content.body = type == "download" ? "Your download has begun" : "Your upload has begun"
+        //content.title = type == "download" ? "Download Started" : "Upload Started"
+        //content.body = type == "download" ? "Your download has begun" : "Your upload has begun"
+        content.title = type == "download" ? "Stahování zahájeno" : "Nahrávání zahájeno"
+        content.body = type == "download" ? "Stahování začalo" : "Nahrávání začalo"
         content.sound = .default
         
         let request = UNNotificationRequest(identifier: "\(type)_start_\(taskId)", 
@@ -668,11 +715,14 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
         let content = UNMutableNotificationContent()
         
         if let error = error {
-            content.title = type == "download" ? "Download Failed" : "Upload Failed"
+            //content.title = type == "download" ? "Download Failed" : "Upload Failed"
+            content.title = type == "download" ? "Stahování se nezdařilo" : "Nahrávání se nezdařilo"
             content.body = error.localizedDescription
         } else {
-            content.title = type == "download" ? "Download Complete" : "Upload Complete"
-            content.body = type == "download" ? "Your download has finished" : "Your upload has finished"
+            //content.title = type == "download" ? "Download Complete" : "Upload Complete"
+            //content.body = type == "download" ? "Your download has finished" : "Your upload has finished"
+            content.title = type == "download" ? "Stahování dokončeno" : "Nahrávání dokončeno"
+            content.body = type == "download" ? "Stahování bylo dokončeno" : "Nahrávání bylo dokončeno"
         }
         content.sound = .default
         
@@ -712,6 +762,8 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
             handleGetProgress(call, result: result, type: "download")
         case "getUploadProgress":
             handleGetProgress(call, result: result, type: "upload")
+        case "getResultStatus":
+            handleGetStatus(call, result: result, type: "status")
         case "isDownloadComplete":
             handleIsComplete(call, result: result, type: "download")
         case "isUploadComplete":
@@ -810,6 +862,40 @@ class ProgressStreamHandler: NSObject, FlutterStreamHandler {
             if let sink = self.eventSink {
                 os_log("Sending progress %{public}f for task: %{public}@", log: logger, type: .debug, progress, self.taskId)
                 sink(progress)
+            } else {
+                os_log("No event sink available for task: %{public}@", log: logger, type: .debug, self.taskId)
+            }
+        }
+    }
+}
+
+class StatusStreamHandler: NSObject, FlutterStreamHandler {
+    private var eventSink: FlutterEventSink?
+    private let taskId: String
+
+    init(taskId: String) {
+        self.taskId = taskId
+        super.init()
+    }
+
+    func onListen(withArguments arguments: Any?, eventSink: @escaping FlutterEventSink) -> FlutterError? {
+        os_log("Status stream listener added for task: %{public}@", log: logger, type: .debug, taskId)
+        self.eventSink = eventSink
+        return nil
+    }
+
+    func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        os_log("Status stream cancelled for task: %{public}@", log: logger, type: .debug, taskId)
+        eventSink = nil
+        return nil
+    }
+
+    func sendStatus(_ status: Int) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if let sink = self.eventSink {
+                os_log("Sending status %{public}f for task: %{public}@", log: logger, type: .debug, status, self.taskId)
+                sink(status)
             } else {
                 os_log("No event sink available for task: %{public}@", log: logger, type: .debug, self.taskId)
             }

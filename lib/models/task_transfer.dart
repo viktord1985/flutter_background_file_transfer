@@ -27,6 +27,9 @@ class TaskTransfer {
   /// Current status of the transfer
   final String status;
 
+  /// httpResponse.statusCode
+  final int? code;
+
   TaskTransfer({
     required this.taskId,
     required this.type,
@@ -37,6 +40,7 @@ class TaskTransfer {
     required this.createdAt,
     required this.progress,
     required this.status,
+    required this.code,
   });
 
   /// Creates a TaskTransfer instance from a map
@@ -51,6 +55,7 @@ class TaskTransfer {
       createdAt: map['createdAt'] as String,
       progress: (map['progress'] as num).toDouble(),
       status: map['status'] as String,
+      code: map['code'] as int?,
     );
   }
 
@@ -66,11 +71,12 @@ class TaskTransfer {
       'createdAt': createdAt,
       'progress': progress,
       'status': status,
+      'code': code,
     };
   }
 
   @override
   String toString() {
-    return 'TaskTransfer(taskId: $taskId, type: $type, url: $url, path: $path, headers: $headers, fields: $fields, createdAt: $createdAt, progress: $progress, status: $status)';
+    return 'TaskTransfer(taskId: $taskId, type: $type, url: $url, path: $path, headers: $headers, fields: $fields, createdAt: $createdAt, progress: $progress, status: $status, code: $code)';
   }
 }

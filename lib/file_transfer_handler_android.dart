@@ -172,6 +172,26 @@ class AndroidFileTransferHandler implements FileTransferHandler {
     }
   }
 
+  @override
+  Stream<int> getResultStatus(String taskId) async* {
+    try {
+      await _channel.invokeMethod('getResultStatus', {
+        'task_id': taskId,
+      });
+
+      final eventChannel =
+      EventChannel('background_transfer/status_progress_$taskId');
+      yield* eventChannel.receiveBroadcastStream().map((status) {
+        if (status is String && status.startsWith('error:')) {
+          throw Exception(status.substring(6));
+        }
+        return (status as num).toInt();
+      });
+    } on PlatformException catch (e) {
+      throw Exception("Failed to get upload progress: ${e.message}");
+    }
+  }
+
   /// Checks if an upload task has completed.
   ///
   /// [taskId] The ID of the upload task to check.

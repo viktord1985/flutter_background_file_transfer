@@ -123,6 +123,7 @@ class TaskTransfer {
     required DateTime createdAt,
     required double progress,
     required TransferStatus status,
+    required int? code,
     Map<String, dynamic>? fields,
   }) : fields = {
           'taskId': taskId,
@@ -132,6 +133,7 @@ class TaskTransfer {
           'createdAt': createdAt.toIso8601String(),
           'progress': progress,
           'status': status.name,
+          'code': code,
           if (fields != null) ...fields, // Include all provided fields
         };
 
@@ -152,6 +154,7 @@ class TaskTransfer {
         (s) => s.name == json['status'],
         orElse: () => TransferStatus.queued,
       ),
+      code: json['code'] as int?,
       fields: Map<String, dynamic>.from(
           json), // Create a new map to ensure type safety
     );
@@ -178,6 +181,7 @@ class TaskTransfer {
     DateTime? createdAt,
     double? progress,
     TransferStatus? status,
+    int? code,
     Map<String, dynamic>? additionalFields,
   }) {
     return TaskTransfer(
@@ -188,6 +192,7 @@ class TaskTransfer {
       createdAt: createdAt ?? this.createdAt,
       progress: progress ?? this.progress,
       status: status ?? this.status,
+      code: code ?? this.code,
       fields: Map.from(fields)
         ..removeWhere((key, _) => {
               'taskId',
@@ -196,7 +201,8 @@ class TaskTransfer {
               'path',
               'createdAt',
               'progress',
-              'status'
+              'status',
+              'code'
             }.contains(key)),
     );
   }
@@ -221,6 +227,8 @@ class TaskTransfer {
 
   /// Current progress (0.0 to 1.0)
   double get progress => (fields['progress'] as num).toDouble();
+
+  int? get code => fields['code'] as int?;
 
   /// Current status of the task
   TransferStatus get status => TransferStatus.values.firstWhere(
@@ -315,6 +323,11 @@ class BackgroundTransfer {
   /// Get a stream of progress updates for an upload task
   static Stream<double> getUploadProgress(String taskId) {
     return _handler.getUploadProgress(taskId);
+  }
+
+  /// Get a stream of progress updates for an upload task
+  static Stream<int> getResultStatus(String taskId) {
+    return _handler.getResultStatus(taskId);
   }
 
   /// Check if an upload task is complete

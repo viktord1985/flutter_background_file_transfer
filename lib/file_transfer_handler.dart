@@ -107,6 +107,8 @@ abstract class FileTransferHandler {
   /// if the upload fails.
   Stream<double> getUploadProgress(String taskId);
 
+  Stream<int> getResultStatus(String taskId);
+
   /// Checks if an upload task has completed successfully.
   ///
   /// Parameters:

@@ -4,6 +4,7 @@ import 'package:background_transfer/file_transfer_handler.dart';
 
 class MockFileTransferHandler implements FileTransferHandler {
   final Map<String, StreamController<double>> _progressControllers = {};
+  final Map<String, StreamController<int>> _statusControllers = {};
   final Map<String, bool> _completedTasks = {};
   final Map<String, Map<String, dynamic>> _taskDetails = {};
   final Map<String, double> _currentProgress = {};
@@ -198,6 +199,15 @@ class MockFileTransferHandler implements FileTransferHandler {
   @override
   Stream<double> getUploadProgress(String taskId) {
     final controller = _progressControllers[taskId];
+    if (controller == null) {
+      throw Exception('Task not found: $taskId');
+    }
+    return controller.stream;
+  }
+
+  @override
+  Stream<int> getResultStatus(String taskId) {
+    final controller = _statusControllers[taskId];
     if (controller == null) {
       throw Exception('Task not found: $taskId');
     }
