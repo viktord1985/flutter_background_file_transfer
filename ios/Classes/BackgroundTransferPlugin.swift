@@ -488,7 +488,7 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
         // Update transfer details and mark as cancelled
         if var details = transferDetails[taskId] {
             let type = details.type
-            details.status = "cancelled"
+            details.status = "Zrušeno"
             details.progress = 0.0
             transferDetails[taskId] = details
             
