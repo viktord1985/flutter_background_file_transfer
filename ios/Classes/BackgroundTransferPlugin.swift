@@ -718,6 +718,9 @@ public class BackgroundTransferPlugin: NSObject, FlutterPlugin, URLSessionTaskDe
             //content.title = type == "download" ? "Download Failed" : "Upload Failed"
             content.title = type == "download" ? "Stahování se nezdařilo" : "Nahrávání se nezdařilo"
             content.body = error.localizedDescription
+            if(content.body == "cancelled" || content.body == "zrušeno")  {
+                return
+            }
         } else {
             //content.title = type == "download" ? "Download Complete" : "Upload Complete"
             //content.body = type == "download" ? "Your download has finished" : "Your upload has finished"
